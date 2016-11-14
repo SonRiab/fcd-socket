@@ -1,0 +1,19 @@
+group 'de.beuth_hochschule.spark.streaming'
+version '1.0-SNAPSHOT'
+
+apply plugin: 'java'
+apply plugin: 'maven'
+
+sourceCompatibility = 1.8
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+}
+
+dependencies {
+    compile group: 'org.apache.spark', name: 'spark-streaming_2.10', version: '1.6.2'
+    compile group: 'de.beuth_hochschule.fcd', name: 'fcd-api', version: '1.0-SNAPSHOT'
+    compile group: 'de.beuth_hochschule.fcd', name: 'fcd-impl', version: '1.0-SNAPSHOT'
+    testCompile group: 'junit', name: 'junit', version: '4.11'
+}
