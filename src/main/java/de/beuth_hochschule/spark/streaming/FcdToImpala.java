@@ -34,11 +34,12 @@ public class FcdToImpala {
     private static final String QUERY = "insert into extfcd values (?, ?, ?, ?, ?, ?, ?)";
 
     private static void printUsage() {
-        System.out.println("Usage: FcdSocket <hostname_port,...> <groupId> <topic> <partitions>");
+        System.out.println("Usage: FcdToImpala <hostname_port,...> <groupId> <topic> <partitions> <jdbc_url>");
         System.out.println("  <hostname_port,...>  a comma-separated list of zookeeper hostname:port urls");
         System.out.println("  <groupId>            the group id to use");
         System.out.println("  <topic>              the topic to consume from");
         System.out.println("  <partitions>         number of partitions to use");
+        System.out.println("  <jdbc_url>           a valid jdbc url");
     }
 
     public static void main(String[] args) throws Exception {
@@ -46,7 +47,8 @@ public class FcdToImpala {
         String zkQuorum = "";
         String groupId = "";
         String topic = "";
-        final String jdbcUrl = "jdbc:impala://quickstart.cloudera:21050/test;AuthMech=0";
+        String url = "";
+//        final String jdbcUrl = "jdbc:impala://quickstart.cloudera:21050/test;AuthMech=0";
         int partitions = -1;
 
         if (args.length < 2) {
@@ -58,15 +60,17 @@ public class FcdToImpala {
             groupId = args[1];
             topic = args[2];
             partitions = Integer.parseInt(args[3]);
+            url = args[4];
         } catch (Exception e) {
             printUsage();
             System.exit(1);
         }
+        final String jdbcUrl = url;
 
         Map<String, Integer> map = new HashMap<>();
         map.put(topic, partitions);
 
-        SparkConf conf = new SparkConf().setAppName("FcdSocket");
+        SparkConf conf = new SparkConf().setAppName("FcdToImpala");
         JavaStreamingContext context = new JavaStreamingContext(conf, Durations.minutes(1));
         JavaPairReceiverInputDStream<String, String> messages = KafkaUtils.createStream(context, zkQuorum, groupId, map);
 
