@@ -10,9 +10,12 @@ import org.apache.log4j.Logger;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.function.Function;
+import org.apache.spark.api.java.function.Function2;
+import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.api.java.function.VoidFunction;
 import org.apache.spark.streaming.Durations;
 import org.apache.spark.streaming.api.java.JavaDStream;
+import org.apache.spark.streaming.api.java.JavaPairDStream;
 import org.apache.spark.streaming.api.java.JavaPairReceiverInputDStream;
 import org.apache.spark.streaming.api.java.JavaStreamingContext;
 import org.apache.spark.streaming.kafka.KafkaUtils;
@@ -30,8 +33,9 @@ import java.util.Map;
 public class FcdToImpala {
 
     private static final Logger _LOG = LogManager.getLogger(FcdToImpala.class);
-    private static final String JDBCDriver = "com.cloudera.impala.jdbc4.Driver";
-    private static final String QUERY = "insert into extfcd values (?, ?, ?, ?, ?, ?, ?)";
+    private static final String JDBCDriver = "com.cloudera.impala.jdbc41.Driver";
+    private static final String EXT_FCD_QUERY = "insert into extfcd values (?, ?, ?, ?, ?, ?, ?)";
+    private static final String ANALYSE_RESULT_QUERY = "insert into extfcd values (?, ?, ?, ?, ?, ?, ?)";
 
     private static void printUsage() {
         System.out.println("Usage: FcdToImpala <hostname_port,...> <groupId> <topic> <partitions> <jdbc_url>");
@@ -48,7 +52,6 @@ public class FcdToImpala {
         String groupId = "";
         String topic = "";
         String url = "";
-//        final String jdbcUrl = "jdbc:impala://quickstart.cloudera:21050/test;AuthMech=0";
         int partitions = -1;
 
         if (args.length < 2) {
@@ -71,7 +74,7 @@ public class FcdToImpala {
         map.put(topic, partitions);
 
         SparkConf conf = new SparkConf().setAppName("FcdToImpala");
-        JavaStreamingContext context = new JavaStreamingContext(conf, Durations.minutes(1));
+        JavaStreamingContext context = new JavaStreamingContext(conf, Durations.seconds(5));
         JavaPairReceiverInputDStream<String, String> messages = KafkaUtils.createStream(context, zkQuorum, groupId, map);
 
         Class.forName(JDBCDriver);
@@ -95,7 +98,7 @@ public class FcdToImpala {
                         int counter = 0;
                         Connection connection = DriverManager.getConnection(jdbcUrl);
                         connection.setAutoCommit(false);
-                        PreparedStatement statement = connection.prepareStatement(QUERY);
+                        PreparedStatement statement = connection.prepareStatement(EXT_FCD_QUERY);
                         try {
                             while (iterator.hasNext()) {
                                 extFCD = iterator.next();
@@ -167,7 +170,55 @@ public class FcdToImpala {
             }
         });
 
+        JavaDStream<ExtendedFloatingCarData> filteredExtFCDs = extFCDs.filter(new Function<ExtendedFloatingCarData, Boolean>() {
+            @Override
+            public Boolean call(ExtendedFloatingCarData v1) throws Exception {
+                return !v1.isDirty();
+            }
+        });
+
+        JavaPairDStream<Location, Integer> pairs = filteredExtFCDs.mapToPair(new PairFunction<ExtendedFloatingCarData, Location, Integer>() {
+
+            @Override
+            public Tuple2<Location, Integer> call(ExtendedFloatingCarData data) throws Exception {
+                return new Tuple2<>(new Location(data.getLongitude(), data.getLatitude()), 1);
+            }
+        });
+
+        JavaPairDStream<Location, Integer> windowedPairCount = pairs.reduceByKeyAndWindow(new Function2<Integer, Integer, Integer>() {
+            @Override
+            public Integer call(Integer v1, Integer v2) throws Exception {
+                return v1 + v2;
+            }
+        }, Durations.minutes(1), Durations.seconds(15));
+        windowedPairCount.print();
+
+
         context.start();
         context.awaitTermination();
+    }
+}
+
+class Location {
+    private Double longitude, latitude;
+
+    Location(Double longitude, Double latitude) {
+        this.latitude = latitude;
+        this.longitude = longitude;
+    }
+
+    @Override
+    public String toString() {
+        return latitude+","+longitude;
+    }
+
+    @Override
+    public int hashCode() {
+        return latitude.hashCode() * longitude.hashCode();
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        return obj instanceof Location && obj.hashCode() == hashCode();
     }
 }
