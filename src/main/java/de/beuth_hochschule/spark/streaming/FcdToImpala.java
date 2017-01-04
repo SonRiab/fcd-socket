@@ -8,6 +8,7 @@ import de.beuth_hochschule.fcd.ExtendedFloatingCarData;
 import org.apache.log4j.LogManager;
 import org.apache.log4j.Logger;
 import org.apache.spark.SparkConf;
+import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.Function2;
@@ -35,7 +36,7 @@ public class FcdToImpala {
     private static final Logger _LOG = LogManager.getLogger(FcdToImpala.class);
     private static final String JDBCDriver = "com.cloudera.impala.jdbc41.Driver";
     private static final String EXT_FCD_QUERY = "insert into extfcd values (?, ?, ?, ?, ?, ?, ?)";
-    private static final String ANALYSE_RESULT_QUERY = "insert into extfcd values (?, ?, ?, ?, ?, ?, ?)";
+    private static final String ANALYSE_RESULT_QUERY = "insert into warnings values (?, ?, ?, ?, ?)";
 
     private static void printUsage() {
         System.out.println("Usage: FcdToImpala <hostname_port,...> <groupId> <topic> <partitions> <jdbc_url>");
@@ -80,12 +81,13 @@ public class FcdToImpala {
         Class.forName(JDBCDriver);
         DriverManager.setLoginTimeout(30);
 
-        final JavaDStream<ExtendedFloatingCarData> extFCDs = messages.map(new Function<Tuple2<String, String>, ExtendedFloatingCarData>() {
+        JavaDStream<ExtendedFloatingCarData> extFCDs = messages.map(new Function<Tuple2<String, String>, ExtendedFloatingCarData>() {
             @Override
             public ExtendedFloatingCarData call(Tuple2<String, String> tuple) throws Exception {
                 return FcdMessageParser.parse(tuple._2());
             }
         });
+
         extFCDs.foreachRDD(new VoidFunction<JavaRDD<ExtendedFloatingCarData>>() {
 
             @Override
@@ -123,7 +125,7 @@ public class FcdToImpala {
                                     statement.setString(1, extFCD.getId());
                                 }
                                 if(null != extFCD.getLongitude()) {
-                                statement.setDouble(2, extFCD.getLongitude());
+                                    statement.setDouble(2, extFCD.getLongitude());
                                 }
                                 if(null != extFCD.getLatitude()) {
                                     statement.setDouble(3, extFCD.getLatitude());
@@ -143,7 +145,7 @@ public class FcdToImpala {
                                 statement.addBatch();
 
                                 /* execute batches of n inserts  */
-                                if (counter++ % 1000 == 0) {
+                                if (counter++ % 100 == 0) {
                                     statement.executeBatch();
                                     connection.commit();
                                     counter = 0;
@@ -177,39 +179,99 @@ public class FcdToImpala {
             }
         });
 
-        JavaPairDStream<Location, Integer> pairs = filteredExtFCDs.mapToPair(new PairFunction<ExtendedFloatingCarData, Location, Integer>() {
+        JavaPairDStream<Vicinity, Integer> pairs = filteredExtFCDs.mapToPair(new PairFunction<ExtendedFloatingCarData, Vicinity, Integer>() {
 
             @Override
-            public Tuple2<Location, Integer> call(ExtendedFloatingCarData data) throws Exception {
-                return new Tuple2<>(new Location(data.getLongitude(), data.getLatitude()), 1);
+            public Tuple2<Vicinity, Integer> call(ExtendedFloatingCarData data) throws Exception {
+                return new Tuple2<>(new Vicinity(data.getLongitude(), data.getLatitude()), 1);
             }
         });
 
-        JavaPairDStream<Location, Integer> windowedPairCount = pairs.reduceByKeyAndWindow(new Function2<Integer, Integer, Integer>() {
+        JavaPairDStream<Vicinity, Integer> windowedPairCount = pairs.reduceByKeyAndWindow(new Function2<Integer, Integer, Integer>() {
             @Override
             public Integer call(Integer v1, Integer v2) throws Exception {
                 return v1 + v2;
             }
-        }, Durations.minutes(1), Durations.seconds(15));
-        windowedPairCount.print();
+        }, Durations.minutes(10), Durations.seconds(30));
 
+        windowedPairCount.foreachRDD(new VoidFunction<JavaPairRDD<Vicinity, Integer>>() {
+            @Override
+            public void call(JavaPairRDD<Vicinity, Integer> pairRDD) throws Exception {
+                pairRDD.foreachPartition(new VoidFunction<Iterator<Tuple2<Vicinity, Integer>>>() {
+                    @Override
+                    public void call(Iterator<Tuple2<Vicinity, Integer>> tuple2Iterator) throws Exception {
+                        _LOG.error("[foreachPartition] ping");
+                        Connection connection = DriverManager.getConnection(jdbcUrl);
+                        connection.setAutoCommit(false);
+                        PreparedStatement statement = connection.prepareStatement(ANALYSE_RESULT_QUERY);
+                        Vicinity vicinity;
+                        int counter = 0;
+                        try {
+                            while (tuple2Iterator.hasNext()) {
+                                Tuple2<Vicinity, Integer> tuple = tuple2Iterator.next();
+                                if(tuple._2() <= 10) {
+                                    continue;
+                                }
+                                vicinity = tuple._1();
+                                statement.setDouble(1, vicinity.getLongitude());
+                                statement.setDouble(2, vicinity.getLatitude());
+                                statement.setInt(3, tuple._2());
+                                statement.setBoolean(4, tuple._2() > 10);
+                                statement.setTimestamp(5, new Timestamp(System.currentTimeMillis()));
+                                statement.addBatch();
+                                _LOG.warn("Staugefahr in der Umgebung von: " + vicinity.toString());
+                                if (counter++ % 100 == 0) {
+                                    statement.executeBatch();
+                                    connection.commit();
+                                    counter = 0;
+                                }
+                            }
+                            /* execute the rest */
+                            statement.executeBatch();
+                            connection.commit();
+                        } catch (SQLException e ) {
+                            try {
+                                _LOG.error("[foreachPartition] Transaction is being rolled back");
+                                _LOG.trace(e);
+                                connection.rollback();
+                            } catch (SQLException excep) {
+                                _LOG.error("[foreachPartition] Transaction is not rolled back");
+                                _LOG.trace(excep);
+                            }
+                        } finally {
+                            statement.close();
+                            connection.close();
+                        }
+                    }
+                });
+            }
+        });
 
         context.start();
         context.awaitTermination();
     }
 }
 
-class Location {
+class Vicinity {
     private Double longitude, latitude;
 
-    Location(Double longitude, Double latitude) {
-        this.latitude = latitude;
-        this.longitude = longitude;
+    Vicinity(Double longitude, Double latitude) {
+        //https://wiki.openstreetmap.org/wiki/DE:Genauigkeit_von_Koordinaten
+        this.latitude = Math.round(latitude * 10000) / 10000.d;
+        this.longitude = Math.round(longitude * 10000) / 10000.d;
     }
 
     @Override
     public String toString() {
         return latitude+","+longitude;
+    }
+
+    public Double getLongitude() {
+        return longitude;
+    }
+
+    public Double getLatitude() {
+        return latitude;
     }
 
     @Override
@@ -219,6 +281,6 @@ class Location {
 
     @Override
     public boolean equals(Object obj) {
-        return obj instanceof Location && obj.hashCode() == hashCode();
+        return obj instanceof Vicinity && obj.hashCode() == hashCode();
     }
 }
